@@ -1,0 +1,336 @@
+import powerfactory as pf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import re
+
+app = pf.GetApplication()
+app.ClearOutputWindow()
+
+app.PrintPlain("===== IEEE 738 DTLR FINAL =====")
+
+# ------------------------------------------------
+# LOAD FLOW
+# ------------------------------------------------
+ldf = app.GetFromStudyCase('ComLdf')
+ldf.Execute()
+
+# ------------------------------------------------
+# CRITICAL LINE
+# ------------------------------------------------
+lines = app.GetCalcRelevantObjects("*.ElmLne")
+
+critical_line = None
+max_loading = 0.0
+
+for line in lines:
+    val = line.GetAttribute("c:loading")
+    if val is not None and val > max_loading:
+        max_loading = val
+        critical_line = line
+
+if critical_line is None:
+    raise Exception("No critical line found.")
+
+app.PrintPlain("Critical Line: " + critical_line.loc_name)
+
+# ------------------------------------------------
+# BUS VOLTAGE
+# ------------------------------------------------
+buses = app.GetCalcRelevantObjects("*.ElmTerm")
+
+bus_data = []
+critical_bus = None
+max_dev = -1.0
+
+for bus in buses:
+    v = bus.GetAttribute("m:u")
+    if v is None:
+        continue
+    bus_data.append((bus.loc_name, v))
+    dev = abs(v - 1.0)
+    if dev > max_dev:
+        max_dev = dev
+        critical_bus = bus
+
+if critical_bus is None:
+    raise Exception("No critical bus found.")
+
+app.PrintPlain("Critical Bus: " + critical_bus.loc_name)
+
+# FACTS suggestions
+for name, v in bus_data:
+    if v < 0.95:
+        app.PrintPlain(f"⚠ {name} undervoltage {v:.3f} pu → Suggest STATCOM / SVC")
+    elif v > 1.05:
+        app.PrintPlain(f"⚠ {name} overvoltage {v:.3f} pu → Suggest Shunt Reactor / TCSC")
+
+# ------------------------------------------------
+# SORT BUS NAMES
+# ------------------------------------------------
+def bus_sort_key(name):
+    nums = re.findall(r'\d+', name)
+    return int(nums[-1]) if nums else 0
+
+bus_data.sort(key=lambda x: bus_sort_key(x[0]))
+bus_names = [x[0] for x in bus_data]
+bus_voltages = [x[1] for x in bus_data]
+
+# ------------------------------------------------
+# RMS SETUP
+# ------------------------------------------------
+elmres = app.GetFromStudyCase("ElmRes")
+elmres.Clear()
+
+elmres.AddVariable(critical_line, "c:loading")
+elmres.AddVariable(critical_bus, "m:u")
+
+# ------------------------------------------------
+# ADD SOLAR AND WIND TO EXPORT
+# ------------------------------------------------
+gens = app.GetCalcRelevantObjects("*.ElmGenstat")
+
+solar_gen = None
+wind_gen = None
+
+for g in gens:
+    lname = g.loc_name.lower()
+    if "solar" in lname and solar_gen is None:
+        solar_gen = g
+    if "wind" in lname and wind_gen is None:
+        wind_gen = g
+
+if solar_gen is not None:
+    app.PrintPlain("Solar generator found: " + solar_gen.loc_name)
+    elmres.AddVariable(solar_gen, "m:P:bus1")
+else:
+    app.PrintPlain("No solar generator found.")
+
+if wind_gen is not None:
+    app.PrintPlain("Wind generator found: " + wind_gen.loc_name)
+    elmres.AddVariable(wind_gen, "m:P:bus1")
+else:
+    app.PrintPlain("No wind generator found.")
+
+# suppress noisy result printing
+elmres.iopt_csel = 0
+elmres.iopt_tsel = 0
+elmres.iopt_locn = 0
+
+# ------------------------------------------------
+# RUN RMS
+# ------------------------------------------------
+ini = app.GetFromStudyCase('ComInc')
+sim = app.GetFromStudyCase('ComSim')
+
+ini.Execute()
+sim.Execute()
+
+# ------------------------------------------------
+# EXPORT CSV
+# ------------------------------------------------
+comres = app.GetFromStudyCase("ComRes")
+csv_path = r"C:\Users\Sanny\OneDrive\Documents\DTLR_results.csv"
+
+comres.iopt_exp = 4
+comres.ciopt_head = 1
+comres.iopt_sep = 0
+comres.f_name = csv_path
+comres.Execute()
+
+# ------------------------------------------------
+# READ CSV WITH FIXED COLUMN MAP
+# ------------------------------------------------
+data = pd.read_csv(csv_path, sep='\t', skiprows=1)
+data = data.dropna(axis=1, how='all')
+
+if data.shape[1] < 3:
+    raise Exception("CSV does not contain enough columns for time, voltage, and loading.")
+
+time = pd.to_numeric(data.iloc[:, 0], errors='coerce')
+voltage = pd.to_numeric(data.iloc[:, 1], errors='coerce')
+loading = pd.to_numeric(data.iloc[:, 2], errors='coerce')
+
+# Renewable profiles:
+# if exported, they must be columns 3 and 4
+if data.shape[1] >= 5:
+    solar = pd.to_numeric(data.iloc[:, 3], errors='coerce')
+    wind = pd.to_numeric(data.iloc[:, 5], errors='coerce')
+else:
+    solar = pd.Series(np.zeros(len(data)), index=data.index)
+    wind = pd.Series(np.zeros(len(data)), index=data.index)
+    app.PrintPlain("Solar/Wind columns not found in CSV. Using zero profile.")
+
+valid = ~(time.isna() | voltage.isna() | loading.isna())
+time = time[valid].reset_index(drop=True)
+voltage = voltage[valid].reset_index(drop=True)
+loading = loading[valid].reset_index(drop=True)
+solar = solar[valid].reset_index(drop=True)
+wind = wind[valid].reset_index(drop=True)
+
+# ------------------------------------------------
+# IEEE 738 DTLR
+# ------------------------------------------------
+def compute_dtlr_ieee738(temp, wind_speed, solar_wm2):
+    D = 0.02862
+    R25 = 0.000068
+    alpha = 0.00403
+    emissivity = 0.5
+    absorptivity = 0.5
+    sigma = 5.67e-8
+
+    Tc = 75 + 273.15
+    Ta = temp + 273.15
+    V = max(wind_speed, 0.1)
+
+    R = R25 * (1 + alpha * (75 - 25))
+
+    Qs = absorptivity * solar_wm2 * D
+    hc = 6.5 + 3.3 * np.sqrt(V)
+    Qc = hc * np.pi * D * (Tc - Ta)
+    Qr = emissivity * sigma * np.pi * D * (Tc**4 - Ta**4)
+
+    heat = max(Qc + Qr - Qs, 1e-6)
+    I_dyn = np.sqrt(heat / R)
+
+    Ta_ref = 32 + 273.15
+    V_ref = 1.0
+    S_ref = 850
+
+    Qs_ref = absorptivity * S_ref * D
+    hc_ref = 6.5 + 3.3 * np.sqrt(V_ref)
+    Qc_ref = hc_ref * np.pi * D * (Tc - Ta_ref)
+    Qr_ref = emissivity * sigma * np.pi * D * (Tc**4 - Ta_ref**4)
+
+    heat_ref = max(Qc_ref + Qr_ref - Qs_ref, 1e-6)
+    I_ref = np.sqrt(heat_ref / R)
+
+    return 100 * (I_dyn / I_ref)
+
+weather_cases = {
+    "Summer": [
+        (0, 32, 2.0, 900),
+        (300, 34, 2.5, 950),
+        (600, 36, 2.0, 920),
+        (900, 33, 3.0, 880),
+        (1200, 32, 3.5, 850)
+    ],
+    "Winter": [
+        (0, 20, 1.2, 600),
+        (300, 22, 1.5, 650),
+        (600, 24, 2.0, 700),
+        (900, 21, 2.2, 620),
+        (1200, 19, 2.5, 580)
+    ],
+    "Monsoon": [
+        (0, 26, 4.0, 400),
+        (300, 27, 4.5, 350),
+        (600, 28, 5.0, 300),
+        (900, 26, 5.5, 280),
+        (1200, 25, 6.0, 250)
+    ]
+}
+
+check_times = [0, 300, 600, 900, 1200]
+
+# ------------------------------------------------
+# DTLR ANALYSIS
+# ------------------------------------------------
+for season, weather in weather_cases.items():
+    app.PrintPlain("\n====================")
+    app.PrintPlain("Season: " + season)
+    app.PrintPlain("====================")
+
+    wt = []
+    rating = []
+
+    for t, temp, wind_speed, solar_wm2 in weather:
+        wt.append(t)
+        rating.append(compute_dtlr_ieee738(temp, wind_speed, solar_wm2))
+
+    dtlr = np.interp(time.to_numpy(), wt, rating)
+    static = np.ones(len(time)) * 100
+
+    for ct in check_times:
+        idx = int(np.abs(time.to_numpy() - ct).argmin())
+        load_val = float(loading.iloc[idx])
+        dtlr_val = float(dtlr[idx])
+
+        app.PrintPlain(f"Time={ct}s Loading={load_val:.2f}% | DTLR={dtlr_val:.2f}%")
+        if load_val > dtlr_val:
+            app.PrintPlain("⚠ ALARM: Thermal overload")
+        else:
+            app.PrintPlain("✔ SAFE")
+
+    plt.figure(figsize=(11, 5))
+    plt.plot(time, loading, label="Line Loading", linewidth=2)
+    plt.plot(time, dtlr, label="IEEE-738 DTLR", linewidth=2)
+    plt.plot(time, static, '--', label="Static Rating", linewidth=2)
+    plt.axvline(x=5, linestyle='--', linewidth=1)
+    plt.title("IEEE-738 DTLR vs Loading (" + season + ")")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Loading (%)")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(rf"C:\Users\Sanny\OneDrive\Documents\IEEE738_{season}.png", dpi=300)
+    plt.close()
+
+# ------------------------------------------------
+# CRITICAL BUS VOLTAGE PLOT
+# ------------------------------------------------
+plt.figure(figsize=(10, 5))
+plt.plot(time, voltage, linewidth=2, label=critical_bus.loc_name)
+plt.axhline(1.05, linestyle='--', linewidth=1)
+plt.axhline(0.95, linestyle='--', linewidth=1)
+plt.text(float(time.iloc[-1]), 1.05, " 1.05 pu limit", va='bottom')
+plt.text(float(time.iloc[-1]), 0.95, " 0.95 pu limit", va='top')
+plt.title("Critical Bus Voltage vs Time (" + critical_bus.loc_name + ")")
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (pu)")
+plt.legend()
+plt.grid()
+plt.tight_layout()
+plt.savefig(r"C:\Users\Sanny\OneDrive\Documents\CriticalBusVoltage.png", dpi=300)
+plt.close()
+
+# ------------------------------------------------
+# BUS VOLTAGE BAR CHART
+# ------------------------------------------------
+plt.figure(figsize=(12, 5))
+plt.bar(range(len(bus_names)), bus_voltages)
+plt.axhline(1.05, linestyle='--', linewidth=1)
+plt.axhline(0.95, linestyle='--', linewidth=1)
+plt.text(len(bus_names) - 1, 1.05, " 1.05 pu limit", va='bottom')
+plt.text(len(bus_names) - 1, 0.95, " 0.95 pu limit", va='top')
+plt.xticks(range(len(bus_names)), bus_names, rotation=45, ha='right')
+plt.title("Bus Voltage Profile")
+plt.ylabel("Voltage (pu)")
+plt.grid(axis='y')
+plt.tight_layout()
+plt.savefig(r"C:\Users\Sanny\OneDrive\Documents\BusVoltage.png", dpi=300)
+plt.close()
+
+# ------------------------------------------------
+# RENEWABLE PROFILES
+# ------------------------------------------------
+plt.figure(figsize=(11, 6))
+
+plt.subplot(2, 1, 1)
+plt.plot(time, solar, linewidth=2)
+plt.title("Solar Generation Profile")
+plt.ylabel("MW")
+plt.grid()
+
+plt.subplot(2, 1, 2)
+plt.plot(time, wind, linewidth=2)
+plt.title("Wind Generation Profile")
+plt.xlabel("Time (s)")
+plt.ylabel("MW")
+plt.grid()
+
+plt.tight_layout()
+plt.savefig(r"C:\Users\Sanny\OneDrive\Documents\RenewableProfiles.png", dpi=300)
+plt.close()
+
+app.PrintPlain("===== FINAL SUCCESS =====")
