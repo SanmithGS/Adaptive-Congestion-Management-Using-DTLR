@@ -83,6 +83,10 @@ Minor_Project/
 │   ├── op_monsoon.png
 │   └── op_winter.png
 │
+└── Documennts/
+│   ├── Minor Project Report.pdf      # Project Report
+│   └── San Minor Project Presentation.pptx        # Project Presentation
+│
 └── Extras/
     ├── Project Overview.png          # High-level framework summary
     └── Study_case_manager.png        # PowerFactory study case structure
