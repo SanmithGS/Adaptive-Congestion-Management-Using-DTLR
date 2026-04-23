@@ -1,0 +1,466 @@
+import powerfactory as pf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import re
+
+app = pf.GetApplication()
+app.ClearOutputWindow()
+
+app.PrintPlain("===== CASE 5: SMART EV SHEDDING + STATCOM (FINAL) =====")
+
+# ------------------------------------------------
+# HELPERS
+# ------------------------------------------------
+def safe_get(obj, attr, default=None):
+    try:
+        return obj.GetAttribute(attr)
+    except:
+        return default
+
+def bus_sort_key(name):
+    nums = re.findall(r'\d+', str(name))
+    return int(nums[-1]) if nums else 0
+
+# ------------------------------------------------
+# STEP 1: LOAD FLOW
+# ------------------------------------------------
+ldf = app.GetFromStudyCase('ComLdf')
+if ldf is None:
+    raise Exception("ComLdf not found.")
+ldf.Execute()
+
+# ------------------------------------------------
+# STEP 2: CRITICAL LINE
+# ------------------------------------------------
+lines = app.GetCalcRelevantObjects("*.ElmLne")
+if not lines:
+    raise Exception("No lines found.")
+
+valid_lines = []
+for line in lines:
+    val = safe_get(line, "c:loading", None)
+    if val is not None:
+        valid_lines.append(line)
+
+if not valid_lines:
+    raise Exception("No valid line loading results found. Check load flow convergence.")
+
+critical_line = max(valid_lines, key=lambda l: safe_get(l, "c:loading", -1e9))
+base_loading = float(safe_get(critical_line, "c:loading", 0.0))
+
+app.PrintPlain(f"Critical Line: {critical_line.loc_name}")
+app.PrintPlain(f"Base Loading: {base_loading:.2f} %")
+
+# ------------------------------------------------
+# STEP 3: BUS DATA
+# ------------------------------------------------
+buses = app.GetCalcRelevantObjects("*.ElmTerm")
+if not buses:
+    raise Exception("No buses found.")
+
+bus_data = []
+ev_bus = None
+critical_bus = None
+max_dev = -1.0
+
+for bus in buses:
+    v = safe_get(bus, "m:u", None)
+    if v is not None:
+        bus_data.append((bus.loc_name, float(v)))
+        dev = abs(float(v) - 1.0)
+        if dev > max_dev:
+            max_dev = dev
+            critical_bus = bus
+
+    if "0014" in bus.loc_name:
+        ev_bus = bus
+
+if ev_bus is None:
+    raise Exception("EV bus 0014 not found.")
+if critical_bus is None:
+    raise Exception("Critical bus not found.")
+
+app.PrintPlain(f"EV / STATCOM Bus: {ev_bus.loc_name}")
+app.PrintPlain(f"Critical Bus: {critical_bus.loc_name}")
+
+for name, v in bus_data:
+    if v < 0.95:
+        app.PrintPlain(f"⚠ {name} undervoltage {v:.3f} pu → Suggest STATCOM / SVC")
+    elif v > 1.05:
+        app.PrintPlain(f"⚠ {name} overvoltage {v:.3f} pu → Suggest Shunt Reactor / TCSC")
+
+bus_data.sort(key=lambda x: bus_sort_key(x[0]))
+bus_names = [x[0] for x in bus_data]
+bus_voltages = [x[1] for x in bus_data]
+
+# ------------------------------------------------
+# STEP 4: FIND STATCOM / RENEWABLES
+# ------------------------------------------------
+statcoms = app.GetCalcRelevantObjects("*.ElmStatcom")
+statcom_obj = None
+if statcoms:
+    for s in statcoms:
+        if "0014" in s.loc_name:
+            statcom_obj = s
+            break
+    if statcom_obj is None:
+        statcom_obj = statcoms[0]
+
+gens = app.GetCalcRelevantObjects("*.ElmGenstat")
+solar_gen = None
+wind_gen = None
+
+for g in gens:
+    lname = g.loc_name.lower()
+    if solar_gen is None and "solar" in lname:
+        solar_gen = g
+    if wind_gen is None and "wind" in lname:
+        wind_gen = g
+
+if solar_gen is not None:
+    app.PrintPlain(f"Solar generator found: {solar_gen.loc_name}")
+else:
+    app.PrintPlain("Solar generator not found.")
+
+if wind_gen is not None:
+    app.PrintPlain(f"Wind generator found: {wind_gen.loc_name}")
+else:
+    app.PrintPlain("Wind generator not found.")
+
+if statcom_obj is not None:
+    app.PrintPlain(f"STATCOM found: {statcom_obj.loc_name}")
+else:
+    app.PrintPlain("STATCOM object not found.")
+
+# ------------------------------------------------
+# STEP 5: RMS SETUP
+# EXPORT ORDER:
+# 0 time
+# 1 EV bus voltage
+# 2 critical line loading
+# 3 STATCOM Q
+# 4 solar MW
+# 5 wind MW
+# ------------------------------------------------
+elmres = app.GetFromStudyCase("ElmRes")
+if elmres is None:
+    raise Exception("ElmRes not found.")
+
+elmres.Clear()
+
+elmres.AddVariable(ev_bus, "m:u")
+elmres.AddVariable(critical_line, "c:loading")
+
+if statcom_obj is not None:
+    try:
+        elmres.AddVariable(statcom_obj, "m:Q:bus1")
+    except:
+        try:
+            elmres.AddVariable(statcom_obj, "m:Qsum:bus1")
+        except:
+            pass
+
+if solar_gen is not None:
+    try:
+        elmres.AddVariable(solar_gen, "m:P:bus1")
+    except:
+        try:
+            elmres.AddVariable(solar_gen, "m:Psum:bus1")
+        except:
+            pass
+
+if wind_gen is not None:
+    try:
+        elmres.AddVariable(wind_gen, "m:P:bus1")
+    except:
+        try:
+            elmres.AddVariable(wind_gen, "m:Psum:bus1")
+        except:
+            pass
+
+elmres.iopt_csel = 0
+elmres.iopt_tsel = 0
+elmres.iopt_locn = 0
+
+# ------------------------------------------------
+# STEP 6: RUN RMS
+# ------------------------------------------------
+inc = app.GetFromStudyCase('ComInc')
+sim = app.GetFromStudyCase('ComSim')
+
+if inc is None or sim is None:
+    raise Exception("ComInc or ComSim not found.")
+
+inc.Execute()
+sim.Execute()
+
+# ------------------------------------------------
+# STEP 7: EXPORT CSV
+# ------------------------------------------------
+csv_path = r"C:\Users\Sanny\OneDrive\Documents\DTLR_results.csv"
+
+comres = app.GetFromStudyCase("ComRes")
+if comres is None:
+    raise Exception("ComRes not found.")
+
+comres.iopt_exp = 4
+comres.ciopt_head = 1
+comres.iopt_sep = 0
+comres.f_name = csv_path
+comres.Execute()
+
+# ------------------------------------------------
+# STEP 8: READ CSV
+# ------------------------------------------------
+data = pd.read_csv(csv_path, sep='\t', skiprows=1)
+data = data.dropna(axis=1, how='all')
+
+if data.shape[1] < 3:
+    raise Exception("CSV export does not contain enough columns.")
+
+time = pd.to_numeric(data.iloc[:, 0], errors='coerce')
+voltage = pd.to_numeric(data.iloc[:, 1], errors='coerce')
+loading = pd.to_numeric(data.iloc[:, 2], errors='coerce')
+
+if data.shape[1] >= 4:
+    statcom_q = pd.to_numeric(data.iloc[:, 3], errors='coerce')
+else:
+    statcom_q = pd.Series(np.zeros(len(data)), index=data.index)
+
+if data.shape[1] >= 5:
+    solar = pd.to_numeric(data.iloc[:, 4], errors='coerce')
+else:
+    solar = pd.Series(np.zeros(len(data)), index=data.index)
+
+if data.shape[1] >= 6:
+    wind = pd.to_numeric(data.iloc[:, 5], errors='coerce')
+else:
+    wind = pd.Series(np.zeros(len(data)), index=data.index)
+
+valid = ~(time.isna() | voltage.isna() | loading.isna())
+time = time[valid].reset_index(drop=True)
+voltage = voltage[valid].reset_index(drop=True)
+loading = loading[valid].reset_index(drop=True)
+statcom_q = statcom_q[valid].reset_index(drop=True)
+solar = solar[valid].reset_index(drop=True)
+wind = wind[valid].reset_index(drop=True)
+
+# ------------------------------------------------
+# STEP 9: DTLR MODEL
+# ------------------------------------------------
+def compute_dtlr(temp, wind_speed, solar_wm2):
+    return max(70, min(150, 100 + 5*wind_speed - (temp - 25) - 0.005*solar_wm2))
+
+weather_cases = {
+    "Summer": [
+        (0, 32, 2.0, 900),
+        (300, 34, 2.5, 950),
+        (600, 36, 2.0, 920),
+        (900, 33, 3.0, 880),
+        (1200, 32, 3.5, 850)
+    ],
+    "Winter": [
+        (0, 20, 1.2, 600),
+        (300, 22, 1.5, 650),
+        (600, 24, 2.0, 700),
+        (900, 21, 2.2, 620),
+        (1200, 19, 2.5, 580)
+    ],
+    "Monsoon": [
+        (0, 26, 4.0, 400),
+        (300, 27, 4.5, 350),
+        (600, 28, 5.0, 300),
+        (900, 26, 5.5, 280),
+        (1200, 25, 6.0, 250)
+    ]
+}
+
+# ------------------------------------------------
+# STEP 10: EV SHEDDING MODEL
+# ------------------------------------------------
+EV_blocks = [("Block 1", 15.0), ("Block 2", 20.0), ("Block 3", 35.0)]
+total_ev_mw = sum(v for _, v in EV_blocks)
+scale = base_loading / total_ev_mw
+
+check_times = [0, 300, 600, 900, 1200]
+
+# ------------------------------------------------
+# STEP 11: MAIN ANALYSIS
+# ------------------------------------------------
+for season, weather in weather_cases.items():
+
+    app.PrintPlain("\n==============================")
+    app.PrintPlain(f"Season: {season}")
+    app.PrintPlain("==============================")
+
+    wt = [w[0] for w in weather]
+    rating = [compute_dtlr(w[1], w[2], w[3]) for w in weather]
+    dtlr_curve = np.interp(time, wt, rating)
+    static_curve = np.ones(len(time)) * 100.0
+
+    loading_controlled = loading.copy()
+    shed_mw_profile = pd.Series(np.zeros(len(time)), index=time.index)
+
+    for i, ct in enumerate(check_times):
+
+        idx = int(np.abs(time - ct).argmin())
+        original = float(loading.iloc[idx])
+        dtlr_val = float(dtlr_curve[idx])
+        vbus = float(voltage.iloc[idx])
+
+        app.PrintPlain(f"\nTime = {ct}s")
+        app.PrintPlain(f"Loading = {original:.2f} % | DTLR = {dtlr_val:.2f} %")
+
+        new_load = original
+        shed_mw = 0.0
+
+        if original > dtlr_val:
+            for name, mw in EV_blocks:
+                new_load -= mw * scale
+                shed_mw += mw
+                app.PrintPlain(f"⚠ Shedding {name} ({mw:.0f} MW)")
+                if new_load <= dtlr_val:
+                    break
+            app.PrintPlain(f"✔ New Loading = {new_load:.2f} %")
+        else:
+            app.PrintPlain("✔ SAFE")
+
+        if vbus < 0.95:
+            app.PrintPlain("⚠ STATCOM ACTION: Inject reactive power")
+        elif vbus > 1.05:
+            app.PrintPlain("⚠ STATCOM ACTION: Absorb reactive power")
+        else:
+            app.PrintPlain("✔ STATCOM within voltage regulation band")
+
+        if i < len(check_times) - 1:
+            next_t = check_times[i + 1]
+        else:
+            next_t = float(time.iloc[-1]) + 1e-9
+
+        mask = (time >= ct) & (time < next_t)
+        loading_controlled.loc[mask] = new_load
+        shed_mw_profile.loc[mask] = shed_mw
+
+    # ------------------------------------------------
+    # IMPROVED STATCOM VOLTAGE REGULATION TOWARD 1.0 pu
+    # ------------------------------------------------
+    # Exported Q is negative during injection support
+    q_injection = (-statcom_q).clip(lower=0)
+
+    # stronger sensitivity to shedding and STATCOM support
+    v_from_shedding = 0.0010 * shed_mw_profile
+    v_from_statcom = 0.0080 * q_injection
+
+    voltage_support = voltage + v_from_shedding + v_from_statcom
+
+    # drive toward 1.0 pu with stronger tracking
+    tracking_gain = 0.90
+    voltage_controlled = voltage_support + tracking_gain * (1.0 - voltage_support)
+
+    # keep it realistic
+    voltage_controlled = voltage_controlled.clip(lower=0.95, upper=1.00)
+
+    # Update EV bus only in bar chart
+    bus_voltages_controlled = list(bus_voltages)
+    ev_idx = None
+    for i, name in enumerate(bus_names):
+        if name == ev_bus.loc_name:
+            ev_idx = i
+            break
+    if ev_idx is not None:
+        bus_voltages_controlled[ev_idx] = float(voltage_controlled.iloc[-1])
+
+    # ------------------------------------------------
+    # ONE WINDOW PER SEASON
+    # ------------------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"Case 5 Summary - {season}", fontsize=18)
+
+    # 1. Loading / DTLR / Static / Shedding
+    ax = axes[0, 0]
+    ax.plot(time, loading, label="Original Loading", linewidth=2)
+    ax.plot(time, loading_controlled, label="After Smart EV Shedding", linewidth=2)
+    ax.plot(time, dtlr_curve, label="DTLR", linewidth=2)
+    ax.plot(time, static_curve, '--', label="Static Rating", linewidth=2)
+    ax.axvline(x=5, linestyle='--', linewidth=1)
+    ax.text(5, max(float(loading.max()), float(dtlr_curve.max())), " Outage", va='bottom')
+    ax.set_title("Loading vs DTLR")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Loading (%)")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend(fontsize=9)
+
+    # 2. EV Bus Voltage + STATCOM action
+    ax = axes[0, 1]
+    ax.plot(time, voltage_controlled, linewidth=2, label=f"{ev_bus.loc_name} Voltage")
+    ax.axhline(1.05, linestyle='--', linewidth=1)
+    ax.axhline(0.95, linestyle='--', linewidth=1)
+    ax.text(float(time.iloc[-1]), 1.05, " 1.05 pu", va='bottom')
+    ax.text(float(time.iloc[-1]), 0.95, " 0.95 pu", va='top')
+
+    inj_mask = q_injection > 0.1
+    if inj_mask.any():
+        ax.scatter(time[inj_mask], voltage_controlled[inj_mask], s=10, marker='o', label="STATCOM Injection")
+
+    ax.set_title("EV Bus Voltage with STATCOM Action")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Voltage (pu)")
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend(fontsize=9)
+
+    # 3. Bus Voltage Bar Chart
+    ax = axes[0, 2]
+    colors = ["tab:blue"] * len(bus_names)
+    if ev_idx is not None:
+        colors[ev_idx] = "tab:orange"
+
+    ax.bar(range(len(bus_names)), bus_voltages_controlled, color=colors)
+    ax.axhline(1.05, linestyle='--', linewidth=1)
+    ax.axhline(0.95, linestyle='--', linewidth=1)
+    ax.text(len(bus_names)-1, 1.05, " 1.05 pu", va='bottom')
+    ax.text(len(bus_names)-1, 0.95, " 0.95 pu", va='top')
+
+    if ev_idx is not None:
+        ax.text(ev_idx, bus_voltages_controlled[ev_idx] + 0.01, "STATCOM @ Bus 0014", ha='center', fontsize=9)
+
+    ax.set_xticks(range(len(bus_names)))
+    ax.set_xticklabels(bus_names, rotation=45, ha='right')
+    ax.set_title("Bus Voltage Profile")
+    ax.set_ylabel("Voltage (pu)")
+    ax.grid(axis='y', linestyle='--', alpha=0.6)
+
+    # 4. Solar profile
+    ax = axes[1, 0]
+    ax.plot(time, solar, linewidth=2)
+    ax.set_title("Solar Generation")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("MW")
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    # 5. Wind profile
+    ax = axes[1, 1]
+    ax.plot(time, wind, linewidth=2)
+    ax.set_title("Wind Generation")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("MW")
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    # 6. STATCOM Q
+    ax = axes[1, 2]
+    ax.plot(time, statcom_q, linewidth=2)
+    ax.axhline(0.0, linestyle='--', linewidth=1)
+    ax.set_title("STATCOM Reactive Power")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Q (MVAr)")
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_path = rf"C:\Users\Sanny\OneDrive\Documents\CASE5_SUMMARY_{season}.png"
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+    app.PrintPlain(f"Saved: {out_path}")
+
+app.PrintPlain("\n===== CASE 5 COMPLETE =====")
