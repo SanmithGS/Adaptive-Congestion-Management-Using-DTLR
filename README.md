@@ -4,7 +4,7 @@ A simulation study of coordinated congestion management in a modern power system
 
 Five progressive study cases evaluate the transition from static thermal rating to a fully adaptive, weather-aware protection framework — benchmarked against the standard voltage limits of **0.95–1.05 p.u.**
 
-> 📄 Results written up as a technical report in IEEE format
+> 📄 Results written up as a technical report
 > **Course Project | Minor Project (EE16096) | NIT Warangal | 2026**
 
 ---
